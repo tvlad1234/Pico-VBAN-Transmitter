@@ -1,0 +1,3 @@
+[submodule "Pico-10BASE-T-Library"]
+	path = Pico-10BASE-T-Library
+	url = https://github.com/tvlad1234/Pico-10BASE-T-Library.git
