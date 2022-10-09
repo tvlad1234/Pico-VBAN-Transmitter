@@ -9,20 +9,24 @@
 // Number of audio samples to buffer
 #define AUDIO_BUFSIZE 64
 
+// Selects the ADC channel to use (second channel is next one after it)
+#define CAPTURE_CHANNEL 1
+
 // Number of audio channels (max 2)
-#define CHANNELS 2
+uint8_t audio_channels = 2;
 
 // Size of the VBAN packet
-#define VBAN_PACKETSIZE (VBAN_HEADER_SIZE + AUDIO_BUFSIZE * CHANNELS)
+uint audio_packetsize;
 
-// Audio sampling rate in kHz
-uint sample_rate = 48;
+// Buttons
+#define SR_BTN_PIN 11   // selects the sampling rate
+#define CHAN_BTN_PIN 12 // toggles between stereo and mono
 
 // IP address of the transmitter. Replace with one coresponding to your configuration.
 uint8_t src_ip[4] = {192, 168, 1, 2};
 
 // IP address of the receiver. Replace with one coresponding to your configuration.
-dest_ip_t dst_ip = {192, 168, 1, 255}; /// and here
+dest_ip_t dst_ip = {192, 168, 1, 255};
 
 // UDP port to send the data to
 uint16_t dst_port = 6980;
@@ -38,16 +42,21 @@ uint8_t *audio_pointer = payload.data + VBAN_HEADER_SIZE;
 dma_channel_config cfg;
 uint dma_chan;
 
+// Available sample rates
+const uint sampleRates[] = {6, 8, 12, 16, 24, 32, 48, 64, 96, 128};
+static uint8_t sampRateIndex = 6;
+
 // Misc variables
-static uint8_t sr;
-uint8_t cnt;
+uint8_t led_cnt;
 bool led_status;
 
 // Function prototypes
 void sample(uint8_t *capture_buf);
 void dma_handler(void);
 void setup_adc_dma(uint num_channels);
-void set_audio_sample_rate(uint samplerate, uint channels);
+void set_audio_sample_rate(T_VBAN_HEADER *header, uint samplerate, uint channels);
+bool readSrButton(void);
+bool readChanButton(void);
 
 // DMA interrupt handler (runs after each audio buffer capture)
 void dma_handler(void)
@@ -64,12 +73,32 @@ void dma_handler(void)
     udp_send_payload(&payload);
 
     // Blink LED
-    if (cnt == 0)
+    if (led_cnt == 0)
     {
         gpio_put(PICO_DEFAULT_LED_PIN, led_status);
         led_status = !led_status;
     }
-    cnt++;
+    led_cnt++;
+
+    // Change sample rate on button press
+    if (readSrButton())
+    {
+        if (sampRateIndex < 9)
+            sampRateIndex++;
+        else
+            sampRateIndex = 0;
+        set_audio_sample_rate(&header, sampleRates[sampRateIndex], audio_channels);
+    }
+
+    // Change number of channels on button press
+    if (readChanButton())
+    {
+        if (audio_channels == 1)
+            audio_channels = 2;
+        else
+            audio_channels = 1;
+        set_audio_sample_rate(&header, sampleRates[sampRateIndex], audio_channels); // number of channels is set alongside the sampling rate
+    }
 
     // Start again
     sample(audio_pointer);
@@ -79,54 +108,94 @@ int main()
 {
     // turbo speed, rev up your engines :D
     vreg_set_voltage(VREG_VOLTAGE_1_15); // overvolt the core just a bit
-    set_sys_clock_khz(300000, true);     // overclock to 300MHz (from 125MHz)
+    set_sys_clock_khz(270000, true);     // overclock to 270MHz (from 125MHz)
 
     // Initialize LED pin
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
 
-    // Initialize the ADC, analog pins and DMA
-    setup_adc_dma(CHANNELS);
+    // Initialize button pins
+    gpio_init(SR_BTN_PIN);
+    gpio_set_dir(SR_BTN_PIN, GPIO_IN);
+    gpio_pull_up(SR_BTN_PIN);
 
-    // Set the audio sampling rate
-    set_audio_sample_rate(sample_rate, CHANNELS);
+    gpio_init(CHAN_BTN_PIN);
+    gpio_set_dir(CHAN_BTN_PIN, GPIO_IN);
+    gpio_pull_up(CHAN_BTN_PIN);
+
+    // Wait for button pins to go up
+    sleep_ms(200);
+
+    // Initialize the ADC, analog pins and DMA
+    setup_adc_dma(audio_channels);
 
     // Initialize Ethernet
     eth_set_ip(src_ip[0], src_ip[1], src_ip[2], src_ip[3]);
     eth_core_start();
 
     // Construct the VBAN protocol header
-    vban_construct_header(&header, sr, VBAN_PROTOCOL_AUDIO, AUDIO_BUFSIZE, CHANNELS, VBAN_DATATYPE_BYTE8, "Pico");
+    vban_construct_header(&header, 0, VBAN_PROTOCOL_AUDIO, AUDIO_BUFSIZE, audio_channels, VBAN_DATATYPE_BYTE8, "Pico");
+
+    // Set the audio sampling rate
+    set_audio_sample_rate(&header, sampleRates[sampRateIndex], audio_channels);
 
     // Set the parameters for the network payload
     payload.ip = dst_ip;
     payload.port = dst_port;
-    payload.length = VBAN_PACKETSIZE;
+    payload.length = audio_packetsize;
 
     // Start the sampling loop
     sample(audio_pointer);
 
     while (1)
     {
-        tight_loop_contents(); // do nothing
+        tight_loop_contents();
     }
 }
 
-// Set audio sample rate
-void set_audio_sample_rate(uint samplerate, uint num_channels)
+bool readSrButton(void)
 {
+    static bool prev = false;
+    bool state = gpio_get(SR_BTN_PIN);
+    bool pressed = false;
+    if (prev != state && !state)
+        pressed = true;
+    prev = state;
+    return pressed;
+}
+
+bool readChanButton(void)
+{
+    static bool prev = false;
+    bool state = gpio_get(CHAN_BTN_PIN);
+    bool pressed = false;
+    if (prev != state && !state)
+        pressed = true;
+    prev = state;
+    return pressed;
+}
+
+// Set audio sample rate
+void set_audio_sample_rate(T_VBAN_HEADER *header, uint samplerate, uint num_channels)
+{
+    // Set packet size according to number of channels
+    audio_packetsize = (VBAN_HEADER_SIZE + AUDIO_BUFSIZE * audio_channels);
+
+    // Set ADC sample rate
     adc_set_clkdiv(48000 / samplerate / num_channels);
 
-    // set sample rate label to use in VBAN packet header
-    sr = vban_get_SR_from_list(samplerate * 1000);
+    // Set sample rate label to use in VBAN packet header
+    header->format_SR = vban_get_SR_from_list(samplerate * 1000);
+    header->format_SR |= VBAN_PROTOCOL_AUDIO << 5; // sub-protocol
+    header->format_nbc = audio_channels - 1;
 }
 
 // Initialize the ADC, analog pins and DMA
 void setup_adc_dma(uint num_channels)
 {
-    // Initialize GPIO pin for every channel
-    for (int i = 0; i < num_channels; i++)
-        adc_gpio_init(26 + i);
+    // Initialize GPIO pin for every used channel
+    adc_gpio_init(26 + CAPTURE_CHANNEL);
+    adc_gpio_init(26 + 1 + CAPTURE_CHANNEL);
 
     // Initialize ADC
     adc_init();
@@ -162,18 +231,21 @@ void setup_adc_dma(uint num_channels)
 void sample(uint8_t *capture_buf)
 {
     // Select ADC inputs
-    if (CHANNELS >= 2)
-        adc_set_round_robin(0x03);
-    adc_select_input(0);
+    if (audio_channels >= 2)
+        adc_set_round_robin(0x03 << CAPTURE_CHANNEL);
+    else
+        adc_set_round_robin(0x00);
+    adc_select_input(CAPTURE_CHANNEL);
 
+    // Drain ADC FIFO
     adc_fifo_drain();
 
     // Configure DMA channel for ADC
     dma_channel_configure(dma_chan, &cfg,
-                          capture_buf,              // dst
-                          &adc_hw->fifo,            // src
-                          AUDIO_BUFSIZE * CHANNELS, // transfer count
-                          true                      // start immediately
+                          capture_buf,                    // dst
+                          &adc_hw->fifo,                  // src
+                          AUDIO_BUFSIZE * audio_channels, // transfer count
+                          true                            // start immediately
     );
 
     // Start the conversion
